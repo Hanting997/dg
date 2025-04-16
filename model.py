@@ -37,115 +37,67 @@ def seq_dict(dictionary, m):
 
 
 
-def vec(x, k=25, m=8, idx=None):
+def vec_avg(x, k=25, m=8, idx=None):
+    """
+    输入:
+        x: (B, 3, N) 的点云张量
+        k: 邻居数量
+        m: 选择 top-m 个法向量用于平均
+        idx: 可选的 knn 索引，形状为 (B, N, k)
+
+    输出:
+        normals: (B, N, 3)，每个点一个平均法向量
+    """
     batch_size, num_dims, num_points = x.shape
+    device = x.device
 
     if idx is None:
-        idx = knn(x, k=k)  # 需要你提前实现 knn 函数
+        idx = knn(x, k=k)  # (B, N, k)，你需要实现 knn()
 
-    dic = {}
+    normals = torch.zeros(batch_size, num_points, 3, device=device)
 
     for batch in range(batch_size):
-        idx_batch = idx[batch]  # (num_points, k)
-
+        idx_batch = idx[batch]  # (N, k)
         for pt in range(num_points):
-            tor_dict = {}
-            center = x[batch, :, pt]  # (num_dims,)
+            center = x[batch, :, pt]  # (3,)
+            tor_list = []
 
-            # 遍历所有邻居对，计算三角形法向量
             for i in range(k):
-                for j in range(i + 1, k):  # i < j 避免重复
-                    ni = idx_batch[pt, i]  # 第 i 个邻居索引
-                    nj = idx_batch[pt, j]  # 第 j 个邻居索引
+                for j in range(i + 1, k):
+                    ni = idx_batch[pt, i]
+                    nj = idx_batch[pt, j]
                     x1 = x[batch, :, ni]
                     x2 = x[batch, :, nj]
 
                     vec1 = x1 - center
                     vec2 = x2 - center
                     normal = torch.cross(vec1, vec2, dim=0)
+                    norm = torch.norm(normal)
+                    if norm > 1e-6:
+                        normal = normal / norm  # 单位化
+                        tor_list.append(normal)
 
-                    tor_dict[(int(ni), int(nj))] = normal
+            # 如果三角形太少，填 0
+            if len(tor_list) == 0:
+                continue
 
-            # 计算每个法向量与其他法向量的夹角相似性（点积）
-            another_dict = {}
-            for key1 in tor_dict:
-                s = 0
-                for key2 in tor_dict:
-                    n1 = tor_dict[key1]
-                    n2 = tor_dict[key2]
-                    s += torch.abs(torch.dot(n1, n2))
-                another_dict[key1] = s
+            # 计算 pairwise 相似性矩阵
+            n = len(tor_list)
+            sim_scores = torch.zeros(n, device=device)
+            for i in range(n):
+                for j in range(n):
+                    sim_scores[i] += torch.abs(torch.dot(tor_list[i], tor_list[j]))
 
-            # 保留 top-m 相似度的三角形
-            sorted_keys = sorted(another_dict.items(), key=lambda x: x[1], reverse=True)
-            top_keys = set([item[0] for item in sorted_keys[:m]])
-            tor_dict = {k: v for k, v in tor_dict.items() if k in top_keys}
+            # 选出 top-m 最相似的法向量
+            top_m_idx = torch.topk(sim_scores, min(m, len(tor_list)))[1]
+            top_normals = torch.stack([tor_list[i] for i in top_m_idx], dim=0)  # (m, 3)
 
-            dic[(batch, pt)] = tor_dict
+            avg_normal = torch.mean(top_normals, dim=0)
+            avg_normal = avg_normal / (torch.norm(avg_normal) + 1e-6)  # 再单位化
+            normals[batch, pt] = avg_normal
 
-    return dic
+    return normals  # (B, N, 3)
 
-
-def vec_to_tensor(dic, batch_size, num_points, m, num_dims=3):
-    features = torch.zeros(batch_size, num_points, m * num_dims)
-
-    for batch in range(batch_size):
-        for pt in range(num_points):
-            tor_dict = dic.get((batch, pt), {})
-            
-            # 初始化法向量池
-            normal_pool = torch.zeros(m, num_dims)
-            
-            # 按相似度选择 top-m 法向量
-            sorted_keys = sorted(tor_dict.items(), key=lambda x: torch.abs(torch.dot(x[1], x[1])), reverse=True)
-            top_keys = [key[0] for key in sorted_keys[:m]]
-            
-            # 填充法向量池
-            for i, (key, normal) in enumerate(tor_dict.items()):
-                if key in top_keys:
-                    index = top_keys.index(key)
-                    normal_pool[index] = normal
-
-            # 将法向量池展平并添加到特征矩阵
-            features[batch, pt] = normal_pool.view(-1)
-
-
-class PointNet(nn.Module):
-    def __init__(self, args, output_channels=40):
-        super(PointNet, self).__init__()
-        self.args = args
-        
-        # 卷积层：减少了卷积层数目，只保留了 3 个卷积层
-        self.conv1 = nn.Conv1d(3, 64, kernel_size=1, bias=False)  # 输入 3 个通道（x, y, z），输出 64 个通道
-        self.conv2 = nn.Conv1d(64, 64, kernel_size=1, bias=False)  # 输入 64 个通道，输出 64 个通道
-        self.conv3 = nn.Conv1d(64, args.emb_dims, kernel_size=1, bias=False)  # 输出嵌入维度的特征
-        
-        # 批归一化层
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.bn3 = nn.BatchNorm1d(args.emb_dims)
-        
-        # 全连接层：减小神经元数量
-        self.linear1 = nn.Linear(args.emb_dims, 256, bias=False)  # 从嵌入维度到 256
-        self.bn4 = nn.BatchNorm1d(256)  # 对全连接层进行批归一化
-        self.dp1 = nn.Dropout(0.3)  # 使用 Dropout，减少过拟合
-        self.linear2 = nn.Linear(256, output_channels)  # 最终输出层，用于分类（或者回归）
-
-    def forward(self, x):
-        # 卷积层 + 批归一化 + 激活函数（ReLU）
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-
-        # 全局池化：池化操作对每个样本的点云进行聚合
-        x = F.adaptive_max_pool1d(x, 1).squeeze()  # 使用最大池化得到全局特征
-
-        # 全连接层 + 激活函数
-        x = F.relu(self.bn4(self.linear1(x)))  # 全连接层 + 激活函数
-        x = self.dp1(x)  # Dropout
-        x = self.linear2(x)  # 输出层
-        
-        return x
 
 class DGCNN(nn.Module):
     def __init__(self, args, output_channels=40):
@@ -154,58 +106,58 @@ class DGCNN(nn.Module):
         self.k = args.k
         self.m = args.m
 
-        self.bn1 = nn.BatchNorm2d(64)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.bn3 = nn.BatchNorm1d(args.emb_dims)
-
+        # 第一阶段：EdgeConv 1
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3 + 3 * self.m, 64, kernel_size=1, bias=False),
-            self.bn1,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=1, bias=False),
-            self.bn2,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv1d(128 + 64, args.emb_dims, kernel_size=1, bias=False),
-            self.bn3,
-            nn.LeakyReLU(negative_slope=0.2)
+            nn.Conv2d(3 + 3, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU()
         )
 
+        # 第二阶段：EdgeConv 2
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64 + 3, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU()
+        )
+
+        # 第三阶段：EdgeConv 3
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64 + 3, 128, kernel_size=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.GELU()
+        )
+
+        # 第四阶段：全局特征映射
+        self.conv4 = nn.Sequential(
+            nn.Conv1d(128 + 64 + 64, args.emb_dims, kernel_size=1, bias=False),
+            nn.BatchNorm1d(args.emb_dims),
+            nn.GELU()
+        )
+
+        # 分类头
         self.linear1 = nn.Linear(args.emb_dims, 256, bias=False)
-        self.bn4 = nn.BatchNorm1d(256)
+        self.bn1 = nn.BatchNorm1d(256)
         self.dp1 = nn.Dropout(p=args.dropout)
         self.linear2 = nn.Linear(256, output_channels)
 
     def forward(self, x):
-        batch_size = x.size(0)
-        num_points = x.size(2)
+        batch_size, _, num_points = x.size()
 
-    # 第一层
-        dic1 = vec(x, k=self.k, m=self.m)
-        feat1 = vec_to_tensor(dic1, batch_size, num_points, self.m).permute(0, 2, 1)
-        x = torch.cat([x, feat1], dim=1)
-        x1 = self.conv1(x)  # [B, 64, N]
-    
-    # 第二层
-        dic2 = vec(x1, k=self.k, m=self.m)
-        feat2 = vec_to_tensor(dic2, batch_size, num_points, self.m).permute(0, 2, 1)
-        x2 = self.conv2(torch.cat([x1, feat2], dim=1).unsqueeze(-1)).squeeze(-1)  # [B, 128, N]
+        # 平均法向量版本
+        normals = vec_avg(x, k=self.k, m=self.m).permute(0, 2, 1)  # (B, 3, N)
+        x1 = self.conv1(torch.cat([x, normals], dim=1).unsqueeze(-1)).squeeze(-1)
 
-    # 第三层
-        dic3 = vec(x2, k=self.k, m=self.m)
-        feat3 = vec_to_tensor(dic3, batch_size, num_points, self.m).permute(0, 2, 1)
-        x3 = self.conv3(torch.cat([x2, feat3], dim=1))  # [B, emb_dims, N]
+        normals2 = vec_avg(x1, k=self.k, m=self.m).permute(0, 2, 1)
+        x2 = self.conv2(torch.cat([x1, normals2], dim=1).unsqueeze(-1)).squeeze(-1)
 
-    # 池化 & 分类头
-        x = F.adaptive_max_pool1d(x3, 1).squeeze(-1)
-        x = F.leaky_relu(self.bn4(self.linear1(x)), negative_slope=0.2)
+        normals3 = vec_avg(x2, k=self.k, m=self.m).permute(0, 2, 1)
+        x3 = self.conv3(torch.cat([x2, normals3], dim=1).unsqueeze(-1)).squeeze(-1)
+
+        x_all = torch.cat((x1, x2, x3), dim=1)
+        x = self.conv4(x_all)
+
+        x = F.adaptive_max_pool1d(x, 1).squeeze(-1)
+        x = F.gelu(self.bn1(self.linear1(x)))
         x = self.dp1(x)
         x = self.linear2(x)
         return x
-
-
-
-
