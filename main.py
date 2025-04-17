@@ -195,6 +195,7 @@ if __name__ == "__main__":
                         help='Num of nearest neighbors to use')
     parser.add_argument('--model_path', type=str, default='', metavar='N',
                         help='Pretrained model path')
+    parser.add_argument('--m', type=int, default=8, help='Parameter m for vec_avg')
     args = parser.parse_args()
 
     _init_()
