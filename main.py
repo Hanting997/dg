@@ -1,3 +1,6 @@
+
+
+# -*- coding: utf-8 -*-
 from __future__ import print_function
 import os
 import argparse
@@ -13,6 +16,12 @@ from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
 
+#if not torch.cuda.is_available():
+ #   raise RuntimeError("CUDA is not available! Check your CUDA installation.")
+#torch.cuda.set_device(0)
+#print("Available CUDA devices:", torch.cuda.device_count())
+#for i in range(torch.cuda.device_count()):
+ #   print(f"Device {i}: {torch.cuda.get_device_name(i)}")
 
 def _init_():
     if not os.path.exists('checkpoints'):
@@ -25,16 +34,28 @@ def _init_():
     os.system('cp model.py checkpoints' + '/' + args.exp_name + '/' + 'model.py.backup')
     os.system('cp util.py checkpoints' + '/' + args.exp_name + '/' + 'util.py.backup')
     os.system('cp data.py checkpoints' + '/' + args.exp_name + '/' + 'data.py.backup')
+    
+    
+
+def get_available_device():
+    device_priority = [0, 5, 4, 3, 2, 1, 7, 6]  
+    for device_id in device_priority:
+        if torch.cuda.is_available() and torch.cuda.memory_allocated(device_id) == 0:
+            return device_id
+    return None
+
 
 def train(args, io):
     train_loader = DataLoader(ModelNet40(partition='train', num_points=args.num_points), num_workers=8,
                               batch_size=args.batch_size, shuffle=True, drop_last=True)
+    print("Train loader ready")
     test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points), num_workers=8,
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
-    device = torch.device("cuda" if args.cuda else "cpu")
+    device = torch.device('cuda:1')
+    
 
-    #Try to load models
+    # Try to load models
     if args.model == 'pointnet':
         model = PointNet(args).to(device)
     elif args.model == 'dgcnn':
@@ -42,59 +63,74 @@ def train(args, io):
     else:
         raise Exception("Not implemented")
     print(str(model))
+    model = model.to(device)  #
+    
 
-    model = nn.DataParallel(model)
+    
     print("Let's use", torch.cuda.device_count(), "GPUs!")
 
     if args.use_sgd:
         print("Use SGD")
-        opt = optim.SGD(model.parameters(), lr=args.lr*100, momentum=args.momentum, weight_decay=1e-4)
+        opt = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=1e-2)
     else:
         print("Use Adam")
-        opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-6)
 
     scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=args.lr)
     
-    criterion = cal_loss
+    criterion = nn.CrossEntropyLoss()
+  
 
     best_test_acc = 0
+    print("start training loop")
     for epoch in range(args.epochs):
+        #print(f"Epoch {epoch} begins")
         scheduler.step()
-        ####################
+        ######################
         # Train
-        ####################
+        ######################
         train_loss = 0.0
         count = 0.0
+        #print(f"Epoch {epoch + 1}/{args.epochs}")
         model.train()
         train_pred = []
         train_true = []
-        for data, label in train_loader:
+        for i,(data, label) in enumerate(train_loader): 
+         #   print(f"Got batch {i}")
             data, label = data.to(device), label.to(device).squeeze()
             data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
             opt.zero_grad()
+          #  print("Forward start")
             logits = model(data)
+           # print("Forward done")
             loss = criterion(logits, label)
+           # print("Loss computed")
             loss.backward()
+            #print("Backward done")
             opt.step()
+            #scheduler.step()
             preds = logits.max(dim=1)[1]
             count += batch_size
             train_loss += loss.item() * batch_size
             train_true.append(label.cpu().numpy())
             train_pred.append(preds.detach().cpu().numpy())
+            scheduler.step()
+            if i % 100 == 99:
+                print(f'Epoch {epoch + 1}, Batch {i + 1}, Loss: {loss.item():.6f}')
         train_true = np.concatenate(train_true)
         train_pred = np.concatenate(train_pred)
         outstr = 'Train %d, loss: %.6f, train acc: %.6f, train avg acc: %.6f' % (epoch,
-                                                                                 train_loss*1.0/count,
+                                                                                 train_loss * 1.0 / count,
                                                                                  metrics.accuracy_score(
                                                                                      train_true, train_pred),
                                                                                  metrics.balanced_accuracy_score(
                                                                                      train_true, train_pred))
         io.cprint(outstr)
 
-        ####################
+        ######################
         # Test
-        ####################
+        ######################
         test_loss = 0.0
         count = 0.0
         model.eval()
@@ -116,7 +152,7 @@ def train(args, io):
         test_acc = metrics.accuracy_score(test_true, test_pred)
         avg_per_class_acc = metrics.balanced_accuracy_score(test_true, test_pred)
         outstr = 'Test %d, loss: %.6f, test acc: %.6f, test avg acc: %.6f' % (epoch,
-                                                                              test_loss*1.0/count,
+                                                                              test_loss * 1.0 / count,
                                                                               test_acc,
                                                                               avg_per_class_acc)
         io.cprint(outstr)
@@ -125,11 +161,13 @@ def train(args, io):
             torch.save(model.state_dict(), 'checkpoints/%s/models/model.t7' % args.exp_name)
 
 
+
+
 def test(args, io):
     test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points),
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
-    device = torch.device("cuda" if args.cuda else "cpu")
+    device = torch.device('cuda:1')
 
     #Try to load models
     model = DGCNN(args).to(device)
@@ -215,4 +253,4 @@ if __name__ == "__main__":
     if not args.eval:
         train(args, io)
     else:
-        test(args, io)
+        test(args, io) 
